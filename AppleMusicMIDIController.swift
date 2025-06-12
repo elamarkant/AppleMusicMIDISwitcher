@@ -9,9 +9,17 @@ class AppleMusicMIDIController {
     private var currentSampleRate: Float64 = 0
     private var currentBitDepth: Int = 0
     private var timer: Timer?
+    private var selectedDeviceID: AudioDeviceID?
+    
+    private struct AudioDeviceInfo {
+        let id: AudioDeviceID
+        let inputChannels: Int
+        let outputChannels: Int
+    }
     
     init() {
         setupMIDI()
+        selectAudioDevice()
         startMonitoring()
     }
     
@@ -35,7 +43,197 @@ class AppleMusicMIDIController {
         print("✅ MIDI 设置完成")
     }
     
+    private func selectAudioDevice() {
+        let devices = getAllAudioDevices()
+        
+        if devices.isEmpty {
+            print("❌ 未找到任何音频设备")
+            return
+        }
+        
+        print("\n🔍 扫描到以下音频设备:")
+        print(String(repeating: "=", count: 50))
+        
+        for (index, device) in devices.enumerated() {
+            let deviceName = getDeviceName(deviceID: device.id) ?? "未知设备"
+            let sampleRate = getCurrentSampleRate(deviceID: device.id)
+            let bitDepth = getCurrentBitDepth(deviceID: device.id)
+            
+            print("\(index + 1). \(deviceName)")
+            print("   设备ID: \(device.id)")
+            print("   当前采样率: \(sampleRate) Hz")
+            print("   当前位深度: \(bitDepth) bit")
+            print("   输入通道: \(device.inputChannels), 输出通道: \(device.outputChannels)")
+            print("")
+        }
+        
+        print("请选择要自动更改设置的设备 (输入序号 1-\(devices.count)):")
+        
+        if let input = readLine(), let choice = Int(input), choice >= 1 && choice <= devices.count {
+            selectedDeviceID = devices[choice - 1].id
+            let deviceName = getDeviceName(deviceID: selectedDeviceID!) ?? "未知设备"
+            print("✅ 已选择设备: \(deviceName)")
+        } else {
+            print("❌ 无效选择，将使用默认输出设备")
+            selectedDeviceID = getDefaultOutputDevice()
+        }
+    }
+    
+    private func getAllAudioDevices() -> [AudioDeviceInfo] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size
+        )
+        
+        guard status == noErr else { return [] }
+        
+        let deviceCount = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = Array<AudioDeviceID>(repeating: 0, count: deviceCount)
+        
+        status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceIDs
+        )
+        
+        guard status == noErr else { return [] }
+        
+        var devices: [AudioDeviceInfo] = []
+        
+        for deviceID in deviceIDs {
+            let inputChannels = getChannelCount(deviceID: deviceID, scope: kAudioDevicePropertyScopeInput)
+            let outputChannels = getChannelCount(deviceID: deviceID, scope: kAudioDevicePropertyScopeOutput)
+            
+            // 只包含有输出通道的设备
+            if outputChannels > 0 {
+                devices.append(AudioDeviceInfo(
+                    id: deviceID,
+                    inputChannels: inputChannels,
+                    outputChannels: outputChannels
+                ))
+            }
+        }
+        
+        return devices
+    }
+    
+    private func getChannelCount(deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var size: UInt32 = 0
+        let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+        guard status == noErr else { return 0 }
+        
+        let bufferList = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
+        defer { bufferList.deallocate() }
+        
+        let getStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, bufferList)
+        guard getStatus == noErr else { return 0 }
+        
+        var channelCount = 0
+        let bufferCount = Int(bufferList.pointee.mNumberBuffers)
+        
+        withUnsafePointer(to: &bufferList.pointee.mBuffers) { buffersPtr in
+            let buffers = UnsafeBufferPointer(start: buffersPtr, count: bufferCount)
+            for buffer in buffers {
+                channelCount += Int(buffer.mNumberChannels)
+            }
+        }
+        
+        return channelCount
+    }
+    
+    private func getDeviceName(deviceID: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceNameCFString,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+        guard status == noErr else { return nil }
+        
+        var name: Unmanaged<CFString>?
+        status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name)
+        guard status == noErr, let deviceName = name?.takeRetainedValue() else { return nil }
+        
+        return deviceName as String
+    }
+    
+    private func getCurrentSampleRate(deviceID: AudioDeviceID) -> Float64 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var sampleRate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &sampleRate)
+        return status == noErr ? sampleRate : 0
+    }
+    
+    private func getCurrentBitDepth(deviceID: AudioDeviceID) -> Int {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &format)
+        return status == noErr ? Int(format.mBitsPerChannel) : 0
+    }
+    
+    private func getDefaultOutputDevice() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var deviceID: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        
+        return status == noErr ? deviceID : nil
+    }
+    
     private func startMonitoring() {
+        guard selectedDeviceID != nil else {
+            print("❌ 未选择有效设备，无法开始监控")
+            return
+        }
+        
         print("🎵 开始监控 Apple Music 音频格式变化...")
         
         // 每5秒检查一次
@@ -134,31 +332,103 @@ class AppleMusicMIDIController {
     private func updateMIDISettings(sampleRate: Float64, bitDepth: Int) {
         print("🎛️ 更新 MIDI 设置...")
         
-        // 获取默认输出设备
-        guard let deviceID = getDefaultOutputDevice() else {
-            print("❌ 无法获取默认输出设备")
+        guard let deviceID = selectedDeviceID else {
+            print("❌ 未选择有效设备")
             return
         }
         
+        let deviceName = getDeviceName(deviceID: deviceID) ?? "未知设备"
+        print("🎯 目标设备: \(deviceName)")
+        
+        // 获取当前设置用于比较
+        let currentSampleRate = getCurrentSampleRate(deviceID: deviceID)
+        let currentBitDepth = getCurrentBitDepth(deviceID: deviceID)
+        
+        print("📊 当前设置: \(currentSampleRate) Hz, \(currentBitDepth) bit")
+        print("🎯 目标设置: \(sampleRate) Hz, \(bitDepth) bit")
+        
+        var successCount = 0
+        var totalOperations = 0
+        
         // 设置采样率
-        if setAudioDeviceSampleRate(deviceID: deviceID, sampleRate: sampleRate) {
-            print("✅ MIDI 采样率已更新为: \(sampleRate) Hz")
+        if abs(currentSampleRate - sampleRate) > 1.0 {
+            totalOperations += 1
+            if setAudioDeviceSampleRate(deviceID: deviceID, sampleRate: sampleRate) {
+                print("✅ MIDI 采样率已更新为: \(sampleRate) Hz")
+                successCount += 1
+            } else {
+                print("❌ 更新 MIDI 采样率失败")
+                // 尝试获取设备支持的采样率列表
+                printSupportedSampleRates(deviceID: deviceID)
+            }
         } else {
-            print("❌ 更新 MIDI 采样率失败")
+            print("ℹ️ 采样率无需更改")
         }
         
-        // 设置位深度（如果设备支持）
-        if setBitDepth(deviceID: deviceID, bitDepth: bitDepth) {
-            print("✅ MIDI 位深度已更新为: \(bitDepth) bit")
+        // 设置位深度
+        if currentBitDepth != bitDepth {
+            totalOperations += 1
+            if setBitDepth(deviceID: deviceID, bitDepth: bitDepth) {
+                print("✅ MIDI 位深度已更新为: \(bitDepth) bit")
+                successCount += 1
+            } else {
+                print("❌ 设备不支持 \(bitDepth) bit 位深度")
+                printSupportedFormats(deviceID: deviceID)
+            }
         } else {
-            print("⚠️ 设备可能不支持 \(bitDepth) bit 位深度")
+            print("ℹ️ 位深度无需更改")
         }
         
         // 发送 MIDI 时钟同步消息
         sendMIDIClockSync(sampleRate: sampleRate)
+        
+        // 总结操作结果
+        if totalOperations > 0 {
+            print("📈 操作完成: \(successCount)/\(totalOperations) 成功")
+        } else {
+            print("ℹ️ 设备设置已是目标格式，无需更改")
+        }
+    }
+    
+    private func printSupportedSampleRates(deviceID: AudioDeviceID) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+        guard status == noErr else { return }
+        
+        let rangeCount = Int(size) / MemoryLayout<AudioValueRange>.size
+        var ranges = Array<AudioValueRange>(repeating: AudioValueRange(), count: rangeCount)
+        
+        status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &ranges)
+        guard status == noErr else { return }
+        
+        print("📋 设备支持的采样率范围:")
+        for range in ranges {
+            if range.mMinimum == range.mMaximum {
+                print("   - \(range.mMinimum) Hz")
+            } else {
+                print("   - \(range.mMinimum) - \(range.mMaximum) Hz")
+            }
+        }
+    }
+    
+    private func printSupportedFormats(deviceID: AudioDeviceID) {
+        print("💡 提示: 某些设备可能不支持动态位深度更改")
+        print("   建议在 Audio MIDI Setup 应用中手动配置设备格式")
     }
     
     private func setAudioDeviceSampleRate(deviceID: AudioDeviceID, sampleRate: Float64) -> Bool {
+        // 首先检查设备是否支持该采样率
+        if !isSampleRateSupported(deviceID: deviceID, sampleRate: sampleRate) {
+            print("⚠️ 设备不支持采样率 \(sampleRate) Hz")
+            return false
+        }
+        
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -166,16 +436,62 @@ class AppleMusicMIDIController {
         )
         
         var sampleRateValue = sampleRate
-        let status = AudioObjectSetPropertyData(
-            deviceID,
-            &address,
-            0,
-            nil,
-            UInt32(MemoryLayout<Float64>.size),
-            &sampleRateValue
+        
+        // 重试机制：最多尝试3次
+        for attempt in 1...3 {
+            let status = AudioObjectSetPropertyData(
+                deviceID,
+                &address,
+                0,
+                nil,
+                UInt32(MemoryLayout<Float64>.size),
+                &sampleRateValue
+            )
+            
+            if status == noErr {
+                // 验证设置是否成功
+                Thread.sleep(forTimeInterval: 0.1) // 等待设备响应
+                let actualRate = getCurrentSampleRate(deviceID: deviceID)
+                if abs(actualRate - sampleRate) < 1.0 {
+                    return true
+                } else {
+                    print("⚠️ 采样率设置验证失败，期望: \(sampleRate), 实际: \(actualRate)")
+                }
+            } else {
+                print("⚠️ 采样率设置失败 (尝试 \(attempt)/3)，错误码: \(status)")
+                if attempt < 3 {
+                    Thread.sleep(forTimeInterval: 0.2) // 等待后重试
+                }
+            }
+        }
+        
+        return false
+    }
+    
+    private func isSampleRateSupported(deviceID: AudioDeviceID, sampleRate: Float64) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
         
-        return status == noErr
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+        guard status == noErr else { return false }
+        
+        let rangeCount = Int(size) / MemoryLayout<AudioValueRange>.size
+        var ranges = Array<AudioValueRange>(repeating: AudioValueRange(), count: rangeCount)
+        
+        status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &ranges)
+        guard status == noErr else { return false }
+        
+        for range in ranges {
+            if sampleRate >= range.mMinimum && sampleRate <= range.mMaximum {
+                return true
+            }
+        }
+        
+        return false
     }
     
     private func setBitDepth(deviceID: AudioDeviceID, bitDepth: Int) -> Bool {
@@ -191,29 +507,57 @@ class AppleMusicMIDIController {
         
         // 先获取当前格式
         let getStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &format)
-        guard getStatus == noErr else { return false }
+        guard getStatus == noErr else { 
+            print("⚠️ 无法获取当前音频格式")
+            return false 
+        }
+        
+        // 备份原始格式
+        var originalFormat = format
         
         // 修改位深度
         switch bitDepth {
         case 16:
             format.mBitsPerChannel = 16
-            format.mBytesPerFrame = 4  // 2 channels * 2 bytes
-            format.mBytesPerPacket = 4
+            format.mBytesPerFrame = UInt32(format.mChannelsPerFrame * 2)
+            format.mBytesPerPacket = format.mBytesPerFrame
         case 24:
             format.mBitsPerChannel = 24
-            format.mBytesPerFrame = 6  // 2 channels * 3 bytes
-            format.mBytesPerPacket = 6
+            format.mBytesPerFrame = UInt32(format.mChannelsPerFrame * 3)
+            format.mBytesPerPacket = format.mBytesPerFrame
         case 32:
             format.mBitsPerChannel = 32
-            format.mBytesPerFrame = 8  // 2 channels * 4 bytes
-            format.mBytesPerPacket = 8
+            format.mBytesPerFrame = UInt32(format.mChannelsPerFrame * 4)
+            format.mBytesPerPacket = format.mBytesPerFrame
         default:
+            print("⚠️ 不支持的位深度: \(bitDepth)")
             return false
         }
         
-        // 设置新格式
-        let setStatus = AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &format)
-        return setStatus == noErr
+        // 重试机制：最多尝试3次
+        for attempt in 1...3 {
+            let setStatus = AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &format)
+            
+            if setStatus == noErr {
+                // 验证设置是否成功
+                Thread.sleep(forTimeInterval: 0.1)
+                let actualBitDepth = getCurrentBitDepth(deviceID: deviceID)
+                if actualBitDepth == bitDepth {
+                    return true
+                } else {
+                    print("⚠️ 位深度设置验证失败，期望: \(bitDepth), 实际: \(actualBitDepth)")
+                }
+            } else {
+                print("⚠️ 位深度设置失败 (尝试 \(attempt)/3)，错误码: \(setStatus)")
+                if attempt < 3 {
+                    Thread.sleep(forTimeInterval: 0.2)
+                }
+            }
+        }
+        
+        // 如果所有尝试都失败，恢复原始格式
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &originalFormat)
+        return false
     }
     
     private func sendMIDIClockSync(sampleRate: Float64) {
@@ -230,34 +574,11 @@ class AppleMusicMIDIController {
             
             packet = MIDIPacketListAdd(&packetList, 1024, packet, 0, 1, &clockMessage)
             
-            if packet != nil {
-                MIDISend(outputPort, destination, &packetList)
-            }
+            // 发送 MIDI 消息
+            MIDISend(outputPort, destination, &packetList)
         }
         
         print("🕐 MIDI 时钟同步消息已发送")
-    }
-    
-    private func getDefaultOutputDevice() -> AudioDeviceID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        
-        var deviceID: AudioDeviceID = 0
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            0,
-            nil,
-            &size,
-            &deviceID
-        )
-        
-        return status == noErr ? deviceID : nil
     }
     
     private func cleanup() {
