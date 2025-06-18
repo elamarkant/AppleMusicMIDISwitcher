@@ -10,6 +10,7 @@ class AppleMusicMIDIController {
     private var currentBitDepth: Int = 0
     private var timer: Timer?
     private var selectedDeviceID: AudioDeviceID?
+    private var deviceSupportsBitDepthChange: Bool = false
     
     private struct AudioDeviceInfo {
         let id: AudioDeviceID
@@ -73,9 +74,25 @@ class AppleMusicMIDIController {
             selectedDeviceID = devices[choice - 1].id
             let deviceName = getDeviceName(deviceID: selectedDeviceID!) ?? "未知设备"
             print("✅ 已选择设备: \(deviceName)")
+            
+            // 检测设备是否支持位深度更改
+            deviceSupportsBitDepthChange = checkBitDepthChangeSupport(deviceID: selectedDeviceID!)
+            if deviceSupportsBitDepthChange {
+                print("✅ 设备支持动态位深度更改")
+            } else {
+                print("⚠️ 设备不支持动态位深度更改，将只调整采样率")
+            }
         } else {
             print("❌ 无效选择，将使用默认输出设备")
             selectedDeviceID = getDefaultOutputDevice()
+            if let deviceID = selectedDeviceID {
+                deviceSupportsBitDepthChange = checkBitDepthChangeSupport(deviceID: deviceID)
+                if deviceSupportsBitDepthChange {
+                    print("✅ 默认设备支持动态位深度更改")
+                } else {
+                    print("⚠️ 默认设备不支持动态位深度更改，将只调整采样率")
+                }
+            }
         }
     }
     
@@ -228,6 +245,83 @@ class AppleMusicMIDIController {
         return status == noErr ? deviceID : nil
     }
     
+    private func checkBitDepthChangeSupport(deviceID: AudioDeviceID) -> Bool {
+        print("🔍 检测设备位深度更改支持...")
+        
+        // 获取当前音频格式
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        var currentFormat = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        
+        let getStatus = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &currentFormat)
+        guard getStatus == noErr else {
+            print("⚠️ 无法获取当前音频格式，假设不支持位深度更改")
+            return false
+        }
+        
+        let originalBitDepth = Int(currentFormat.mBitsPerChannel)
+        print("📊 当前位深度: \(originalBitDepth) bit")
+        
+        // 测试不同的位深度设置
+        let testBitDepths = [16, 24, 32].filter { $0 != originalBitDepth }
+        var supportedChanges = 0
+        
+        for testBitDepth in testBitDepths {
+            print("🧪 测试 \(testBitDepth) bit 支持...")
+            
+            // 创建测试格式
+            var testFormat = currentFormat
+            testFormat.mBitsPerChannel = UInt32(testBitDepth)
+            
+            switch testBitDepth {
+            case 16:
+                testFormat.mBytesPerFrame = UInt32(testFormat.mChannelsPerFrame * 2)
+            case 24:
+                testFormat.mBytesPerFrame = UInt32(testFormat.mChannelsPerFrame * 3)
+            case 32:
+                testFormat.mBytesPerFrame = UInt32(testFormat.mChannelsPerFrame * 4)
+            default:
+                continue
+            }
+            testFormat.mBytesPerPacket = testFormat.mBytesPerFrame
+            
+            // 尝试设置测试格式
+            let testStatus = AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &testFormat)
+            
+            if testStatus == noErr {
+                // 验证设置是否真的生效
+                Thread.sleep(forTimeInterval: 0.1)
+                let actualBitDepth = getCurrentBitDepth(deviceID: deviceID)
+                
+                if actualBitDepth == testBitDepth {
+                    print("✅ \(testBitDepth) bit 支持")
+                    supportedChanges += 1
+                } else {
+                    print("❌ \(testBitDepth) bit 设置失败（验证不通过）")
+                }
+                
+                // 恢复原始格式
+                AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &currentFormat)
+                Thread.sleep(forTimeInterval: 0.1)
+            } else {
+                print("❌ \(testBitDepth) bit 不支持（错误码: \(testStatus)）")
+            }
+        }
+        
+        // 确保恢复到原始格式
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &currentFormat)
+        
+        let isSupported = supportedChanges > 0
+        print("📋 位深度更改支持检测完成: \(supportedChanges)/\(testBitDepths.count) 种格式支持")
+        
+        return isSupported
+    }
+    
     private func startMonitoring() {
         guard selectedDeviceID != nil else {
             print("❌ 未选择有效设备，无法开始监控")
@@ -365,18 +459,22 @@ class AppleMusicMIDIController {
             print("ℹ️ 采样率无需更改")
         }
         
-        // 设置位深度
-        if currentBitDepth != bitDepth {
-            totalOperations += 1
-            if setBitDepth(deviceID: deviceID, bitDepth: bitDepth) {
-                print("✅ MIDI 位深度已更新为: \(bitDepth) bit")
-                successCount += 1
+        // 设置位深度（仅在设备支持时）
+        if deviceSupportsBitDepthChange {
+            if currentBitDepth != bitDepth {
+                totalOperations += 1
+                if setBitDepth(deviceID: deviceID, bitDepth: bitDepth) {
+                    print("✅ MIDI 位深度已更新为: \(bitDepth) bit")
+                    successCount += 1
+                } else {
+                    print("❌ 设备不支持 \(bitDepth) bit 位深度")
+                    printSupportedFormats(deviceID: deviceID)
+                }
             } else {
-                print("❌ 设备不支持 \(bitDepth) bit 位深度")
-                printSupportedFormats(deviceID: deviceID)
+                print("ℹ️ 位深度无需更改")
             }
         } else {
-            print("ℹ️ 位深度无需更改")
+            print("⏭️ 跳过位深度更改（设备不支持动态位深度更改）")
         }
         
         // 发送 MIDI 时钟同步消息
